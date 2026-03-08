@@ -23,8 +23,10 @@ public class MechanicalSympathyIndexedMap<K, V> {
     // Cache line padding to prevent false sharing (64 bytes typical)
     private volatile long p1, p2, p3, p4, p5, p6, p7, p8;
 
-    private final int initialCapacity;
+    private final float loadFactor = 0.75f; // Standard load factor
+    private int initialCapacity;
     private volatile int size;
+    private volatile int threshold; // When to resize
 
     // Pre-allocated arrays for mechanical sympathy - all in contiguous memory
     private volatile Object[] keys;      // K[]
@@ -43,6 +45,7 @@ public class MechanicalSympathyIndexedMap<K, V> {
         // Ensure power of 2 for fast modulo operations
         this.initialCapacity = Integer.highestOneBit(initialCapacity) << 1;
         this.size = 0;
+        this.threshold = (int) (this.initialCapacity * loadFactor);
 
         // Pre-allocate all arrays to avoid dynamic resizing during operation
         this.keys = new Object[this.initialCapacity];
@@ -59,14 +62,60 @@ public class MechanicalSympathyIndexedMap<K, V> {
     }
 
     /**
+     * Resizes the hash table to accommodate more entries.
+     * Doubles the capacity and rehashes all existing entries.
+     */
+    private void resize() {
+        int newCapacity = initialCapacity * 2;
+
+        // Create new arrays
+        Object[] newKeys = new Object[newCapacity];
+        Object[] newValues = new Object[newCapacity];
+        boolean[] newOccupied = new boolean[newCapacity];
+
+        // Rehash all existing entries
+        for (int i = 0; i < size; i++) {
+            int oldHashIndex = indices[i];
+            K key = (K) keys[oldHashIndex];
+            V value = (V) values[oldHashIndex];
+
+            // Find new hash slot
+            int newHash = key.hashCode() & (newCapacity - 1);
+            int startIndex = newHash;
+            do {
+                if (!newOccupied[newHash]) {
+                    newKeys[newHash] = key;
+                    newValues[newHash] = value;
+                    newOccupied[newHash] = true;
+                    indices[i] = newHash; // Update index mapping
+                    break;
+                }
+                newHash = (newHash + 1) & (newCapacity - 1);
+            } while (newHash != startIndex);
+        }
+
+        // Update instance variables
+        keys = newKeys;
+        values = newValues;
+        occupied = newOccupied;
+        initialCapacity = newCapacity;
+        threshold = (int) (newCapacity * loadFactor);
+    }
+
+    /**
      * High-performance put operation with mechanical sympathy optimizations.
-     * Minimizes branches and memory allocations in the hot path.
+     * Automatically resizes when load factor is exceeded.
      */
     @SuppressWarnings("unchecked")
     public V put(K key, V value) {
         if (key == null) return null;
 
         synchronized (structureLock) {
+            // Check if we need to resize before attempting insertion
+            if (size >= threshold) {
+                resize();
+            }
+
             int hash = key.hashCode() & (initialCapacity - 1); // Fast modulo for power of 2
             int startIndex = hash;
 
@@ -89,7 +138,9 @@ public class MechanicalSympathyIndexedMap<K, V> {
                 hash = (hash + 1) & (initialCapacity - 1);
             } while (hash != startIndex);
 
-            throw new IllegalStateException("Hash table full - increase initial capacity");
+            // If we get here, resize and try again (shouldn't happen with proper load factor)
+            resize();
+            return put(key, value); // Recursive call after resize
         }
     }
 
@@ -290,8 +341,10 @@ public class MechanicalSympathyIndexedMap<K, V> {
             if (index < 0 || index > size) {
                 throw new IndexOutOfBoundsException("Index: " + index + ", Size: " + size);
             }
-            if (size >= initialCapacity) {
-                throw new IllegalStateException("Map full - cannot add more entries");
+
+            // Check if we need to resize
+            if (size >= threshold) {
+                resize();
             }
 
             // Find empty hash slot
@@ -302,8 +355,16 @@ public class MechanicalSympathyIndexedMap<K, V> {
                 hash = (hash + 1) & (initialCapacity - 1);
             } while (hash != startIndex);
 
+            // If still no slot after potential resize, force another resize
             if (occupied[hash]) {
-                throw new IllegalStateException("No available hash slots");
+                resize();
+                // Recalculate hash for new capacity
+                hash = key.hashCode() & (initialCapacity - 1);
+                startIndex = hash;
+                do {
+                    if (!occupied[hash]) break;
+                    hash = (hash + 1) & (initialCapacity - 1);
+                } while (hash != startIndex);
             }
 
             // Store the entry
@@ -331,8 +392,13 @@ public class MechanicalSympathyIndexedMap<K, V> {
             if (index < 0 || index > size) {
                 throw new IndexOutOfBoundsException("Index: " + index + ", Size: " + size);
             }
-            if (size + entries.size() > initialCapacity) {
-                throw new IllegalStateException("Not enough capacity for " + entries.size() + " entries");
+
+            // Check if we need to resize
+            if (size + entries.size() > threshold) {
+                // Resize to accommodate all new entries
+                while (size + entries.size() > initialCapacity * loadFactor) {
+                    resize();
+                }
             }
 
             // Check for duplicate keys
@@ -357,8 +423,19 @@ public class MechanicalSympathyIndexedMap<K, V> {
                     hash = (hash + 1) & (initialCapacity - 1);
                 } while (hash != startIndex);
 
+                // If no slot found, we need to resize (shouldn't happen with proper sizing)
                 if (occupied[hash]) {
-                    throw new IllegalStateException("No available hash slots for key: " + key);
+                    resize();
+                    // Recalculate for this key with new capacity
+                    hash = key.hashCode() & (initialCapacity - 1);
+                    startIndex = hash;
+                    do {
+                        if (!occupied[hash]) {
+                            hashSlots[slotIndex - 1] = hash; // Update last slot
+                            break;
+                        }
+                        hash = (hash + 1) & (initialCapacity - 1);
+                    } while (hash != startIndex);
                 }
             }
 
@@ -394,8 +471,9 @@ public class MechanicalSympathyIndexedMap<K, V> {
         if (entries == null) throw new IllegalArgumentException("Entries cannot be null");
 
         synchronized (structureLock) {
-            if (entries.size() > initialCapacity) {
-                throw new IllegalArgumentException("Too many entries: " + entries.size() + " > capacity " + initialCapacity);
+            // Ensure capacity is sufficient
+            while (entries.size() > initialCapacity * loadFactor) {
+                resize();
             }
 
             // Clear existing data
@@ -419,8 +497,16 @@ public class MechanicalSympathyIndexedMap<K, V> {
                     hash = (hash + 1) & (initialCapacity - 1);
                 } while (hash != startIndex);
 
+                // If collision, resize and retry (shouldn't happen with proper sizing)
                 if (occupied[hash]) {
-                    throw new IllegalStateException("Hash collision during clearAndAdd for key: " + key);
+                    resize();
+                    // Retry with new capacity
+                    hash = key.hashCode() & (initialCapacity - 1);
+                    startIndex = hash;
+                    do {
+                        if (!occupied[hash]) break;
+                        hash = (hash + 1) & (initialCapacity - 1);
+                    } while (hash != startIndex);
                 }
 
                 keys[hash] = key;
