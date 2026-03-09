@@ -180,6 +180,8 @@ public class ThreadSafeIndexedMap<K, V> {
 
     /**
      * Add a single entry at a specific index. O(n) operation.
+     * Inserts at the index and shifts existing entries. If the key already exists, removes the old entry and inserts at the new index with the updated value.
+     * Always shifts data.
      */
     public void addAtIndex(int index, K key, V value) {
         lock.writeLock().lock();
@@ -187,10 +189,19 @@ public class ThreadSafeIndexedMap<K, V> {
             if (index < 0 || index > values.size()) {
                 throw new IndexOutOfBoundsException("Index: " + index + ", Size: " + values.size());
             }
-            if (keyToIndexMap.containsKey(key)) {
-                throw new IllegalArgumentException("Key already exists: " + key);
+            
+            Integer existingIndex = keyToIndexMap.get(key);
+            if (existingIndex != null) {
+                // Key exists, remove from old position
+                indices.remove((int) existingIndex);
+                values.remove((int) existingIndex);
+                // Adjust index if inserting before the old position
+                if (index > existingIndex) {
+                    index--;
+                }
             }
             
+            // Insert at the new index
             indices.add(index, key);
             values.add(index, value);
             keyToIndexMap.put(key, index);
@@ -205,7 +216,9 @@ public class ThreadSafeIndexedMap<K, V> {
     }
 
     /**
-     * Add multiple entries at a specific index. O(n + m) where m = entries to add.
+     * Add multiple entries at a specific index. O(n + m) where m = new entries to add.
+     * Only adds entries with keys that don't already exist. Inserts at the index and shifts existing entries.
+     * Behaves like ArrayList.addAll(index, collection) but only for new keys.
      */
     public void addAtIndex(int index, Map<K, V> entries) {
         lock.writeLock().lock();
@@ -214,19 +227,29 @@ public class ThreadSafeIndexedMap<K, V> {
                 throw new IndexOutOfBoundsException("Index: " + index + ", Size: " + values.size());
             }
             
-            int currentIndex = index;
+            // Collect new entries (keys not already present)
+            List<Map.Entry<K, V>> newEntries = new ArrayList<>();
             for (Map.Entry<K, V> entry : entries.entrySet()) {
-                if (keyToIndexMap.containsKey(entry.getKey())) {
-                    throw new IllegalArgumentException("Key already exists: " + entry.getKey());
+                if (!keyToIndexMap.containsKey(entry.getKey())) {
+                    newEntries.add(entry);
                 }
+            }
+            
+            if (newEntries.isEmpty()) {
+                return;
+            }
+            
+            // Insert all new entries at the index
+            int currentIndex = index;
+            for (Map.Entry<K, V> entry : newEntries) {
                 indices.add(currentIndex, entry.getKey());
                 values.add(currentIndex, entry.getValue());
                 keyToIndexMap.put(entry.getKey(), currentIndex);
                 currentIndex++;
             }
             
-            // Remap all indices after insertion
-            for (int i = index + entries.size(); i < indices.size(); i++) {
+            // Remap indices for all keys from the insertion point onwards
+            for (int i = index + newEntries.size(); i < indices.size(); i++) {
                 keyToIndexMap.put(indices.get(i), i);
             }
         } finally {
